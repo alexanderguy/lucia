@@ -15,27 +15,57 @@ import type {
 	QueryResultRow
 } from "pg";
 
-export const pgAdapter = (
-	pool: Pool,
-	tables: {
+export type TableConfig = {
 		user: string;
 		session: string;
 		key: string;
+};
+
+class ProviderOps<T extends Pool | PoolClient> {
+	pool: T;
+
+	constructor(pool: T) {
+		this.pool = pool;
 	}
-): InitializeAdapter<Adapter> => {
-	const transaction = async (
-		execute: (connection: PoolClient) => Promise<any>
-	): Promise<void> => {
-		const connection = await pool.connect();
+
+	async exec(query: string, arg?: any[]) {
+		return this.pool.query(query, arg);
+	}
+
+	async get<U extends QueryResultRow>(query: string, arg?: any[]) {
+		return get<U>(this.pool.query(query, arg));
+	}
+
+	async getAll<U extends QueryResultRow>(query: string, arg?: any[]) {
+		return getAll<U>(this.pool.query(query, arg));
+	}
+}
+
+type TXHandler = (fn: ProviderOps<PoolClient>) => Promise<any>;
+
+class provider extends ProviderOps<Pool> {
+	constructor(pool: Pool) {
+		super(pool);
+	}
+
+	async transaction(execute: TXHandler) {
+		const p = new ProviderOps(await this.pool.connect());
 		try {
-			await connection.query("BEGIN");
-			await execute(connection);
-			await connection.query("COMMIT");
+			await p.exec("BEGIN");
+			await execute(p);
+			await p.exec("COMMIT");
 		} catch (e) {
-			connection.query("ROLLBACK");
+			p.exec("ROLLBACK");
 			throw e;
 		}
-	};
+	}
+}
+
+export const pgAdapter = (
+	pool: Pool,
+	tables: TableConfig
+): InitializeAdapter<Adapter> => {
+	const db = new provider(pool);
 
 	const ESCAPED_USER_TABLE_NAME = escapeName(tables.user);
 	const ESCAPED_SESSION_TABLE_NAME = escapeName(tables.session);
@@ -44,31 +74,31 @@ export const pgAdapter = (
 	return (LuciaError) => {
 		return {
 			getUser: async (userId) => {
-				const result = await get<UserSchema>(
-					pool.query(`SELECT * FROM ${ESCAPED_USER_TABLE_NAME} WHERE id = $1`, [
-						userId
-					])
+				const result = await db.get<UserSchema>(
+					`SELECT * FROM ${ESCAPED_USER_TABLE_NAME} WHERE id = $1`,
+					[userId]
 				);
+
 				return result;
 			},
 			setUser: async (user, key) => {
 				if (!key) {
 					const [userFields, userValues, userArgs] = helper(user);
-					await pool.query(
+					await db.exec(
 						`INSERT INTO ${ESCAPED_USER_TABLE_NAME} ( ${userFields} ) VALUES ( ${userValues} )`,
 						userArgs
 					);
 					return;
 				}
 				try {
-					await transaction(async (tx) => {
+					await db.transaction(async (tx) => {
 						const [userFields, userValues, userArgs] = helper(user);
-						await tx.query(
+						await tx.exec(
 							`INSERT INTO ${ESCAPED_USER_TABLE_NAME} ( ${userFields} ) VALUES ( ${userValues} )`,
 							userArgs
 						);
 						const [keyFields, keyValues, keyArgs] = helper(key);
-						await tx.query(
+						await tx.exec(
 							`INSERT INTO ${ESCAPED_KEY_TABLE_NAME} ( ${keyFields} ) VALUES ( ${keyValues} )`,
 							keyArgs
 						);
@@ -82,14 +112,13 @@ export const pgAdapter = (
 				}
 			},
 			deleteUser: async (userId) => {
-				await pool.query(
-					`DELETE FROM ${ESCAPED_USER_TABLE_NAME} WHERE id = $1`,
-					[userId]
-				);
+				await db.exec(`DELETE FROM ${ESCAPED_USER_TABLE_NAME} WHERE id = $1`, [
+					userId
+				]);
 			},
 			updateUser: async (userId, partialUser) => {
 				const [fields, values, args] = helper(partialUser);
-				await pool.query(
+				await db.exec(
 					`UPDATE ${ESCAPED_USER_TABLE_NAME} SET ${getSetArgs(
 						fields,
 						values
@@ -99,27 +128,23 @@ export const pgAdapter = (
 			},
 
 			getSession: async (sessionId) => {
-				const result = await get<PgSession>(
-					pool.query(
-						`SELECT * FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE id = $1`,
-						[sessionId]
-					)
+				const result = await db.get<PgSession>(
+					`SELECT * FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE id = $1`,
+					[sessionId]
 				);
 				return result ? transformPgSession(result) : null;
 			},
 			getSessionsByUserId: async (userId) => {
-				const result = await getAll<PgSession>(
-					pool.query(
-						`SELECT * FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE user_id = $1`,
-						[userId]
-					)
+				const result = await db.getAll<PgSession>(
+					`SELECT * FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE user_id = $1`,
+					[userId]
 				);
 				return result.map((val) => transformPgSession(val));
 			},
 			setSession: async (session) => {
 				try {
 					const [fields, values, args] = helper(session);
-					await pool.query(
+					await db.exec(
 						`INSERT INTO ${ESCAPED_SESSION_TABLE_NAME} ( ${fields} ) VALUES ( ${values} )`,
 						args
 					);
@@ -135,20 +160,20 @@ export const pgAdapter = (
 				}
 			},
 			deleteSession: async (sessionId) => {
-				await pool.query(
+				await db.exec(
 					`DELETE FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE id = $1`,
 					[sessionId]
 				);
 			},
 			deleteSessionsByUserId: async (userId) => {
-				await pool.query(
+				await db.exec(
 					`DELETE FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE user_id = $1`,
 					[userId]
 				);
 			},
 			updateSession: async (sessionId, partialSession) => {
 				const [fields, values, args] = helper(partialSession);
-				await pool.query(
+				await db.exec(
 					`UPDATE ${ESCAPED_SESSION_TABLE_NAME} SET ${getSetArgs(
 						fields,
 						values
@@ -158,27 +183,23 @@ export const pgAdapter = (
 			},
 
 			getKey: async (keyId) => {
-				const result = await get(
-					pool.query<KeySchema>(
-						`SELECT * FROM ${ESCAPED_KEY_TABLE_NAME} WHERE id = $1`,
-						[keyId]
-					)
+				const result = await db.get<KeySchema>(
+					`SELECT * FROM ${ESCAPED_KEY_TABLE_NAME} WHERE id = $1`,
+					[keyId]
 				);
 				return result;
 			},
 			getKeysByUserId: async (userId) => {
-				const result = getAll<KeySchema>(
-					pool.query(
-						`SELECT * FROM ${ESCAPED_KEY_TABLE_NAME} WHERE user_id = $1`,
-						[userId]
-					)
+				const result = db.getAll<KeySchema>(
+					`SELECT * FROM ${ESCAPED_KEY_TABLE_NAME} WHERE user_id = $1`,
+					[userId]
 				);
 				return result;
 			},
 			setKey: async (key) => {
 				try {
 					const [fields, values, args] = helper(key);
-					await pool.query(
+					await db.exec(
 						`INSERT INTO ${ESCAPED_KEY_TABLE_NAME} ( ${fields} ) VALUES ( ${values} )`,
 						args
 					);
@@ -197,20 +218,19 @@ export const pgAdapter = (
 				}
 			},
 			deleteKey: async (keyId) => {
-				await pool.query(
-					`DELETE FROM ${ESCAPED_KEY_TABLE_NAME} WHERE id = $1`,
-					[keyId]
-				);
+				await db.exec(`DELETE FROM ${ESCAPED_KEY_TABLE_NAME} WHERE id = $1`, [
+					keyId
+				]);
 			},
 			deleteKeysByUserId: async (userId) => {
-				await pool.query(
+				await db.exec(
 					`DELETE FROM ${ESCAPED_KEY_TABLE_NAME} WHERE user_id = $1`,
 					[userId]
 				);
 			},
 			updateKey: async (keyId, partialKey) => {
 				const [fields, values, args] = helper(partialKey);
-				await pool.query(
+				await db.exec(
 					`UPDATE ${ESCAPED_KEY_TABLE_NAME} SET ${getSetArgs(
 						fields,
 						values
@@ -220,22 +240,20 @@ export const pgAdapter = (
 			},
 
 			getSessionAndUser: async (sessionId) => {
-				const getSessionPromise = get(
-					pool.query<PgSession>(
-						`SELECT * FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE id = $1`,
-						[sessionId]
-					)
+				const getSessionPromise = db.get<PgSession>(
+					`SELECT * FROM ${ESCAPED_SESSION_TABLE_NAME} WHERE id = $1`,
+					[sessionId]
 				);
-				const getUserFromJoinPromise = get(
-					pool.query<
-						UserSchema & {
-							__session_id: string;
-						}
-					>(
-						`SELECT ${ESCAPED_USER_TABLE_NAME}.*, ${ESCAPED_SESSION_TABLE_NAME}.id as __session_id FROM ${ESCAPED_SESSION_TABLE_NAME} INNER JOIN ${ESCAPED_USER_TABLE_NAME} ON ${ESCAPED_USER_TABLE_NAME}.id = ${ESCAPED_SESSION_TABLE_NAME}.user_id WHERE ${ESCAPED_SESSION_TABLE_NAME}.id = $1`,
-						[sessionId]
-					)
+
+				const getUserFromJoinPromise = db.get<
+					UserSchema & {
+						__session_id: string;
+					}
+				>(
+					`SELECT ${ESCAPED_USER_TABLE_NAME}.*, ${ESCAPED_SESSION_TABLE_NAME}.id as __session_id FROM ${ESCAPED_SESSION_TABLE_NAME} INNER JOIN ${ESCAPED_USER_TABLE_NAME} ON ${ESCAPED_USER_TABLE_NAME}.id = ${ESCAPED_SESSION_TABLE_NAME}.user_id WHERE ${ESCAPED_SESSION_TABLE_NAME}.id = $1`,
+					[sessionId]
 				);
+
 				const [sessionResult, userFromJoinResult] = await Promise.all([
 					getSessionPromise,
 					getUserFromJoinPromise
